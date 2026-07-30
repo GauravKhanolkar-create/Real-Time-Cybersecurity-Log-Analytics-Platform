@@ -1,0 +1,17 @@
+# Optional: only needed if you write a custom Python script that queries or
+# writes to MySQL directly (the core pipeline does NOT need this -- Spark
+# writes to MySQL via its own JDBC driver inside stream_processor.py, and
+# the schema in storage/init_mysql.sql is loaded automatically by the
+# mysql container on first start).
+#
+# mysql-connector-python has reliable prebuilt wheels across Windows,
+# macOS, and Linux, so it should install cleanly with:
+#
+#   uv pip install -r requirements-mysql-optional.txt
+#
+# PyMySQL (pure Python, no compiled dependencies at all) is an alternative
+# if you'd prefer to avoid any binary wheel entirely:
+#
+#   uv pip install PyMySQL
+
+mysql-connector-python==8.4.0
