@@ -1,0 +1,496 @@
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  environment:
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: '120'
+    AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+    KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+    KAFKA_TOPIC_RAW: ${KAFKA_TOPIC_RAW}
+    ES_HOST: ${ES_HOST}
+    ES_PORT: ${ES_PORT}
+    ES_INDEX_HARMFUL: ${ES_INDEX_HARMFUL}
+    MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    REPORTING_DB_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${REPORTING_DB}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./data:/opt/airflow/data
+    - ./spark:/opt/spark-apps
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks:
+    - cybersec-net
+
+services:
+
+  # ─────────────────────────────────────────
+  # ZOOKEEPER
+  # ─────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - cybersec-net
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────
+  # KAFKA BROKER (dual listener: internal + host)
+  # ─────────────────────────────────────────
+  kafka-broker:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-broker
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: 3
+    networks:
+      - cybersec-net
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ─────────────────────────────────────────
+  # KAFKA UI
+  # ─────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka-broker:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: cybersec-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-broker:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - cybersec-net
+    mem_limit: 384m
+
+  # ─────────────────────────────────────────
+  # POSTGRES (Airflow metadata + reporting DB)
+  # A second database ("reporting") is created automatically
+  # on first boot by scripts/postgres-init.sh below.
+  # ─────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      REPORTING_DB: ${REPORTING_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sh:/docker-entrypoint-initdb.d/postgres-init.sh
+    ports:
+      - "5432:5432"
+    networks:
+      - cybersec-net
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────
+  # REDIS (Celery broker)
+  # ─────────────────────────────────────────
+  redis:
+    image: redis:7.2
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - cybersec-net
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────
+  # MINIO (S3-compatible object storage)
+  # ─────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    networks:
+      - cybersec-net
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET_NORMAL: ${MINIO_BUCKET_NORMAL}
+      MINIO_BUCKET_CHECKPOINTS: ${MINIO_BUCKET_CHECKPOINTS}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      mc mb myminio/${MINIO_BUCKET_NORMAL} --ignore-existing;
+      mc mb myminio/${MINIO_BUCKET_CHECKPOINTS} --ignore-existing;
+      echo 'MinIO buckets created';
+      "
+    networks:
+      - cybersec-net
+    mem_limit: 128m
+
+  # ─────────────────────────────────────────
+  # ELASTICSEARCH
+  # ─────────────────────────────────────────
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    container_name: elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - cybersec-net
+    mem_limit: 2048m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+
+  # ─────────────────────────────────────────
+  # KIBANA
+  # ─────────────────────────────────────────
+  kibana:
+    image: kibana:8.11.0
+    container_name: kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    networks:
+      - cybersec-net
+    mem_limit: 700m
+
+  # ─────────────────────────────────────────
+  # SPARK CLUSTER
+  # ─────────────────────────────────────────
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-master
+    command: /opt/bitnami/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    environment:
+      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      # These matter here (not just on the workers) because
+      # `spark-submit` run via `docker exec spark-master ...` executes
+      # the driver process — and therefore every os.getenv() call in
+      # streaming_job.py / rollup_job.py — inside THIS container.
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_TOPIC_RAW: ${KAFKA_TOPIC_RAW}
+      ES_HOST: ${ES_HOST}
+      ES_PORT: ${ES_PORT}
+      ES_INDEX_HARMFUL: ${ES_INDEX_HARMFUL}
+      REPORTING_DB_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${REPORTING_DB}
+      TRAINING_DATA_PATH: /opt/data/logs.csv
+    volumes:
+      - ./spark:/opt/spark-apps
+      - ./data:/opt/data
+    networks:
+      - cybersec-net
+    mem_limit: 1500m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  spark-worker-1:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-worker-1
+    command: /opt/bitnami/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_WORKER_CORES: 2
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - ./spark:/opt/spark-apps
+      - ./data:/opt/data
+    networks:
+      - cybersec-net
+    mem_limit: 1500m
+
+  spark-worker-2:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-worker-2
+    command: /opt/bitnami/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "8082:8081"
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_WORKER_CORES: 2
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - ./spark:/opt/spark-apps
+      - ./data:/opt/data
+    networks:
+      - cybersec-net
+    mem_limit: 1500m
+
+  # ─────────────────────────────────────────
+  # AIRFLOW
+  # airflow-worker gets the Docker CLI + the host's Docker socket
+  # mounted in (see airflow/Dockerfile) so it can run
+  # `docker exec spark-master spark-submit ...` directly —
+  # this avoids depending on a spark-submit binary inside the
+  # Airflow image, which does not ship with one.
+  # ─────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command: >
+      -c "
+        airflow db migrate &&
+        ( airflow users create --username ${AIRFLOW_ADMIN_USER} --password ${AIRFLOW_ADMIN_PASSWORD} --firstname Admin --lastname User --role Admin --email ${AIRFLOW_ADMIN_EMAIL} || true )
+      "
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: airflow webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8089:8080"
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    mem_limit: 1200m
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: airflow scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+    mem_limit: 1000m
+
+  airflow-worker:
+    <<: *airflow-common
+    container_name: airflow-worker
+    # Runs as root (uid 0) ONLY so it can read /var/run/docker.sock
+    # regardless of the host's docker group GID. This container executes
+    # BashOperator tasks (docker exec spark-master spark-submit ...),
+    # which is the fix for the earlier gap where airflow-worker had no
+    # spark-submit binary and no Docker CLI/socket access at all.
+    user: "0:0"
+    # Bypass the base image's default entrypoint (which re-execs as the
+    # non-root airflow user before running the command, which would
+    # undo the root access we need for the Docker socket) and instead
+    # chmod the socket, then run the Celery worker directly as root.
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "chmod 666 /var/run/docker.sock || true; export PYTHONPATH=/home/airflow/.local/lib/python3.11/site-packages:\$$PYTHONPATH; export PATH=/home/airflow/.local/bin:\$$PATH; exec airflow celery worker"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+    mem_limit: 1000m
+
+  # ─────────────────────────────────────────
+  # APACHE SUPERSET (Normal-traffic dashboards, backed by the
+  # Postgres "reporting" database — not Trino/Hive over MinIO,
+  # to avoid an 18th container on a 16GB laptop).
+  # ─────────────────────────────────────────
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: superset
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+    volumes:
+      - superset_home:/app/superset_home
+    networks:
+      - cybersec-net
+    mem_limit: 900m
+
+  # ─────────────────────────────────────────
+  # EMAIL ALERT SERVICE
+  # Polls Elasticsearch for severity=HIGH AND alerted=false,
+  # emails via SMTP, then marks alerted=true.
+  # ─────────────────────────────────────────
+  alert-service:
+    build:
+      context: ./alerting
+      dockerfile: Dockerfile
+    container_name: alert-service
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      ES_HOST: ${ES_HOST}
+      ES_PORT: ${ES_PORT}
+      ES_INDEX_HARMFUL: ${ES_INDEX_HARMFUL}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      ALERT_FROM_EMAIL: ${ALERT_FROM_EMAIL}
+      ALERT_TO_EMAIL: ${ALERT_TO_EMAIL}
+      ALERT_POLL_INTERVAL_SECONDS: ${ALERT_POLL_INTERVAL_SECONDS}
+      ALERT_SEVERITY_THRESHOLD: ${ALERT_SEVERITY_THRESHOLD}
+    networks:
+      - cybersec-net
+    restart: on-failure
+    mem_limit: 256m
+
+  # ─────────────────────────────────────────
+  # LOG PRODUCER
+  # NOTE: deliberately NOT auto-started as a long-running
+  # service. It exposes a Flask control API (start/health) and
+  # is triggered by the Airflow DAG so ingestion begins only
+  # after Kafka/Spark/ML are confirmed ready.
+  # ─────────────────────────────────────────
+  log-producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: log-producer
+    depends_on:
+      kafka-broker:
+        condition: service_healthy
+    ports:
+      - "5050:5000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_TOPIC: ${KAFKA_TOPIC_RAW}
+      CSV_PATH: ${CSV_PATH}
+      STREAM_DELAY_MS: ${STREAM_DELAY_MS}
+    volumes:
+      - ./data:/data
+    networks:
+      - cybersec-net
+    restart: on-failure
+    mem_limit: 256m
+
+networks:
+  cybersec-net:
+    driver: bridge
+
+volumes:
+  minio_data:
+  es_data:
+  postgres_data:
+  superset_home:

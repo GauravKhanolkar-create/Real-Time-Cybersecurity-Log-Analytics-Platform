@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+airflow/logs/*
+!airflow/logs/.gitkeep
+spark/models/*
+!spark/models/.gitkeep
+.DS_Store
+*.log
+.venv/

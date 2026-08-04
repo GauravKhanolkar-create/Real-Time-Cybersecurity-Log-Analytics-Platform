@@ -1,0 +1,29 @@
+{
+  "mappings": {
+    "properties": {
+      "log_id":             { "type": "keyword" },
+      "id":                 { "type": "long" },
+      "ingestion_time":     { "type": "date" },
+      "producer_timestamp": { "type": "date" },
+      "dur":                { "type": "double" },
+      "proto":              { "type": "keyword" },
+      "service":            { "type": "keyword" },
+      "state":              { "type": "keyword" },
+      "spkts":              { "type": "integer" },
+      "dpkts":              { "type": "integer" },
+      "sbytes":             { "type": "long" },
+      "dbytes":             { "type": "long" },
+      "rate":               { "type": "double" },
+      "sttl":               { "type": "integer" },
+      "dttl":               { "type": "integer" },
+      "sload":              { "type": "double" },
+      "dload":              { "type": "double" },
+      "attack_cat":         { "type": "keyword" },
+      "label":              { "type": "integer" },
+      "threat_label":       { "type": "keyword" },
+      "severity":           { "type": "keyword" },
+      "is_harmful":         { "type": "boolean" },
+      "alerted":            { "type": "boolean" }
+    }
+  }
+}
